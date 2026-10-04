@@ -24,8 +24,8 @@ RUN pip install --upgrade pip && \
 # Copy application source
 COPY opencine/ ./opencine/
 COPY config/ ./config/
-COPY workflows/ ./workflows/
+COPY examples/ ./examples/
 COPY main.py .
 
 ENTRYPOINT ["python", "main.py"]
-CMD ["healthcheck"]
+CMD ["doctor"]

@@ -48,3 +48,6 @@ storage/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated identity anchors (master portraits, candidates) are local to each machine
+config/characters/*/

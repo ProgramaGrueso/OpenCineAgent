@@ -1,0 +1,71 @@
+{
+  "title": "The Rooftop Protocol",
+  "premise": "Elena Vance confronts Victor Cross on a rainy rooftop about a breached encryption protocol.",
+  "genre": "Noir thriller",
+  "language": "English",
+  "visual_style": "photorealistic cinematic film still, natural skin texture, shallow depth of field, cool teal night grade",
+  "scenes": [
+    {
+      "scene_id": "SC_01",
+      "title": "The Rooftop",
+      "location": "the flat concrete rooftop of a downtown office tower at night, wet with rain, a low parapet, glowing city skyline and distant neon signs behind",
+      "time_of_day": "night",
+      "mood": "tense",
+      "action_summary": "Elena finds Victor waiting on the rooftop and accuses him.",
+      "music_description": "low cello drone, slow distant pulse, sparse piano notes",
+      "shots": [
+        {
+          "shot_id": "SH_001",
+          "shot_type": "wide",
+          "camera_motion": "dolly_in",
+          "action_description": "Elena Vance steps out of the stairwell door onto the wet rooftop and walks slowly toward the camera through the rain, her coat moving in the wind",
+          "stage_id": "stage_rooftop",
+          "character_ids": ["elena_vance"],
+          "dialogue": [],
+          "sound_description": "Steady rain on concrete, wind gusts, distant city traffic, her footsteps splashing",
+          "duration_sec": 5.0
+        },
+        {
+          "shot_id": "SH_002",
+          "shot_type": "close_up",
+          "camera_motion": "static",
+          "action_description": "Elena Vance stops, raindrops on her face, looks straight into the camera with cold certainty and speaks",
+          "stage_id": "stage_rooftop",
+          "character_ids": ["elena_vance"],
+          "dialogue": [
+            {
+              "speaker_id": "elena_vance",
+              "speaker_name": "Elena Vance",
+              "text": "You knew the encryption was already breached, Victor.",
+              "emotion": "cold and controlled",
+              "start_offset": 0.6,
+              "duration": 3.2
+            }
+          ],
+          "sound_description": "Rain on concrete, wind, distant thunder",
+          "duration_sec": 6.0
+        },
+        {
+          "shot_id": "SH_003",
+          "shot_type": "close_up",
+          "camera_motion": "static",
+          "action_description": "Victor Cross, standing under the rain by the parapet, adjusts his signet ring, looks into the camera with a faint smile and answers",
+          "stage_id": "stage_rooftop",
+          "character_ids": ["victor_cross"],
+          "dialogue": [
+            {
+              "speaker_id": "victor_cross",
+              "speaker_name": "Victor Cross",
+              "text": "Breached? No, Elena. It was designed to open.",
+              "emotion": "calm and arrogant",
+              "start_offset": 0.8,
+              "duration": 3.0
+            }
+          ],
+          "sound_description": "Rain on concrete, wind, a distant siren",
+          "duration_sec": 6.0
+        }
+      ]
+    }
+  ]
+}

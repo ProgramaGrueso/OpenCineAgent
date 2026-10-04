@@ -1,89 +1,64 @@
 """Agent 12: Music & Scoring Agent (Layer D).
-Generates mood-based thematic background scores separated per scene.
+
+H3 clips are rendered with "non_diegetic_music: No music." and the score is laid in post, so it
+runs continuously across cuts instead of restarting every shot.
+  none     no score
+  file     a music file you own or licensed (--music): trimmed to the film with fades
+  minimax  MiniMax Music 3 in ComfyUI, from the scenes' music directions
 """
 
 from __future__ import annotations
 
-import math
-import struct
-import wave
 from pathlib import Path
+from typing import Optional
+
 from opencine.agents.base import BaseAgent
+from opencine.core import media
+from opencine.core.comfy_client import ComfyUIClient, comfy_client
 from opencine.core.config import settings
-from opencine.core.models import AudioTrack, SceneScript
+from opencine.core.models import AudioTrack, ProductionScript
+from opencine.core.seeds import stable_seed
+from opencine.workflows import minimax_music3
 
 
 class MusicScoringAgent(BaseAgent):
-    """Composes mood-driven ambient music score tracks."""
-
-    def __init__(self) -> None:
+    def __init__(self, client: Optional[ComfyUIClient] = None, mode: Optional[str] = None) -> None:
         super().__init__(name="MusicScoringAgent", layer="Layer D")
+        self.comfy = client or comfy_client
+        self.mode = mode or settings.music_mode
 
-    def _synthesize_score_wav(
-        self,
-        output_path: Path,
-        duration_sec: float,
-        mood: str = "tense"
-    ) -> Path:
-        """Synthesizes rich cinematic atmospheric score (deep pads, minor chords, drone)."""
-        sample_rate = settings.voice_sample_rate
-        total_samples = int(duration_sec * sample_rate)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    def caption(self, script: ProductionScript) -> str:
+        directions = [s.music_description for s in script.scenes if s.music_description]
+        moods = ", ".join(dict.fromkeys(s.mood for s in script.scenes))
+        base = "; ".join(directions) if directions else f"cinematic {script.genre.lower()} film score, {moods}"
+        return f"Instrumental film score, no vocals. {base}"
 
-        # Minor triad chord frequencies: D Minor (D2 = 73.42Hz, F2 = 87.31Hz, A2 = 110.0Hz)
-        frequencies = [73.42, 87.31, 110.0, 146.83]
+    async def execute(self, script: ProductionScript, total_duration: float, out_dir: Path,
+                      music_file: Optional[Path] = None) -> Optional[AudioTrack]:
+        mode = "file" if music_file else self.mode
+        if mode == "none":
+            return None
+        raw: Path
+        if mode == "file":
+            if not music_file or not Path(music_file).exists():
+                raise FileNotFoundError(f"Music file not found: {music_file}")
+            raw = Path(music_file)
+        elif mode == "minimax":
+            wf = minimax_music3(self.caption(script), "", total_duration + 2.0,
+                                stable_seed(script.title, "score"), "opencine/score")
+            raw = (await self.comfy.run(wf, out_dir / "audio" / "raw", "music:score",
+                                        suffixes=(".flac", ".wav", ".mp3", ".opus")))[0]
+        else:
+            raise ValueError(f"Unknown music mode '{mode}' (none | file | minimax)")
 
-        with wave.open(str(output_path), "wb") as wav:
-            wav.setnchannels(2)  # Stereo
-            wav.setsampwidth(2)  # 16-bit
-            wav.setframerate(sample_rate)
-
-            frames = bytearray()
-            for i in range(total_samples):
-                t = i / sample_rate
-                # Cinematic slow swell envelope
-                swell = 0.5 + 0.5 * math.sin(2 * math.pi * 0.08 * t)
-
-                # Left channel synthesis
-                val_left = (
-                    0.4 * math.sin(2 * math.pi * frequencies[0] * t) +
-                    0.3 * math.sin(2 * math.pi * frequencies[1] * t + 0.2) +
-                    0.2 * math.sin(2 * math.pi * frequencies[3] * t)
-                )
-
-                # Right channel with detune / chorus effect
-                val_right = (
-                    0.4 * math.sin(2 * math.pi * (frequencies[0] * 1.003) * t) +
-                    0.3 * math.sin(2 * math.pi * frequencies[2] * t + 0.5) +
-                    0.2 * math.sin(2 * math.pi * (frequencies[3] * 0.997) * t)
-                )
-
-                int_l = max(-32768, min(32767, int(val_left * swell * 18000.0)))
-                int_r = max(-32768, min(32767, int(val_right * swell * 18000.0)))
-
-                frames.extend(struct.pack("<hh", int_l, int_r))
-
-            wav.writeframes(frames)
-
-        return output_path
-
-    async def execute(self, scene: SceneScript, cumulative_start: float, duration_sec: float) -> AudioTrack:
-        """Generates continuous score track for the scene."""
-        music_dir = settings.workspace_dir / "audio" / "music"
-        music_dir.mkdir(parents=True, exist_ok=True)
-
-        music_file = music_dir / f"{scene.scene_id}_score_bed.wav"
-        self.logger.info(f"Composing score for scene '{scene.title}' ({duration_sec:.1f}s, mood: {scene.mood})")
-        self._synthesize_score_wav(music_file, duration_sec, mood=scene.mood)
-
-        track = AudioTrack(
-            track_id=f"score_{scene.scene_id}",
-            track_type="music",
-            file_path=str(music_file),
-            start_time=cumulative_start,
-            duration_sec=duration_sec,
-            gain_db=-8.0,
-            metadata={"scene_id": scene.scene_id, "mood": scene.mood}
-        )
-        await self.emit("score.composed", track.model_dump())
+        target = out_dir / "audio" / "score.wav"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fade_out = max(0.0, total_duration - 2.5)
+        await media.run_cmd(["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1", "-i", raw, "-t", f"{total_duration:.3f}",
+                             "-af", f"afade=t=in:d=1.5,afade=t=out:st={fade_out:.3f}:d=2.5", "-ar", "48000",
+                             "-ac", "2", target])
+        track = AudioTrack(track_id="score", track_type="music", file_path=str(target),
+                           duration_sec=total_duration, gain_db=settings.music_gain_db,
+                           metadata={"mode": mode, "source": str(raw)})
+        await self.emit("score.ready", track.model_dump())
         return track

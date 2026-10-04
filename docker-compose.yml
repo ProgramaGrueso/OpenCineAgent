@@ -50,8 +50,8 @@ services:
       - OPENCINE_COMFYUI_PORT=8188
       - OPENCINE_OLLAMA_URL=http://ollama:11434
       - OPENCINE_LLM_SCRIPTWRITER_MODEL=qwen3:8b
-      - OPENCINE_VLM_REVIEWER_MODEL=qwen2.5-vl:7b
+      - OPENCINE_VLM_REVIEWER_MODEL=qwen2.5vl:7b
     volumes:
       - ./workspace:/app/workspace
       - ./config:/app/config
-    command: ["python", "main.py", "healthcheck"]
+    command: ["python", "main.py", "doctor"]

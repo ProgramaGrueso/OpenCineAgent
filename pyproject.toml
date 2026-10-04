@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opencine"
-version = "1.0.0"
-description = "OpenCineAgent: Modular 14-Agent Production Pipeline for Autonomous Open Cinema"
+version = "2.0.0"
+description = "OpenCineAgent: 14-agent film production pipeline on local open models (MiniMax H3 + Krea 2 via ComfyUI)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -18,12 +18,13 @@ dependencies = [
     "httpx>=0.27.0",
     "rich>=13.7.0",
     "typer>=0.12.0",
-    "pyyaml>=6.0.1",
-    "pillow>=10.2.0",
     "numpy>=1.26.0"
 ]
 
 [project.optional-dependencies]
+qc = [
+    "faster-whisper>=1.0.0"
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0"

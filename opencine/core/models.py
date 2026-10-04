@@ -1,7 +1,7 @@
 """OpenCineAgent Core Data Models.
 
-Defines the domain entities for scriptwriting, shotlist, identity registry,
-ComfyUI rendering, VLM quality control, and audio/video assembly.
+Domain entities for scriptwriting, identity, ComfyUI rendering (Krea 2 + MiniMax H3),
+quality control and final assembly.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ class CameraMotion(str, Enum):
     CRANE_UP = "crane_up"
     ORBIT_360 = "orbit_360"
     TRACKING = "tracking_shot"
+    HANDHELD = "handheld"
 
 
 class ShotType(str, Enum):
@@ -34,38 +35,71 @@ class ShotType(str, Enum):
 
 class HealingAction(str, Enum):
     NONE = "none"
-    FACE_DETAILER = "face_detailer"  # Mild issue: FaceDetailer / SAM inpaint
-    RETRY_MUTATION = "retry_mutation"  # Critical issue: mutate seed / motion bucket
+    RETRY_NEW_SEED = "retry_new_seed"   # anatomy / identity / dialogue failures: same prompt, new seed
+    SHORTEN_CLIP = "shorten_clip"       # CUDA OOM: fewer frames fit in VRAM
+
+
+class CheckStatus(str, Enum):
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"   # the check could not run (tool or model missing): never counted as a pass
+
+
+_SHOT_ALIASES = {
+    "closeup": ShotType.CLOSE_UP, "cu": ShotType.CLOSE_UP, "ecu": ShotType.EXTREME_CLOSE_UP,
+    "wide_shot": ShotType.WIDE, "establishing": ShotType.EXTREME_WIDE, "mid_shot": ShotType.MEDIUM,
+    "medium_shot": ShotType.MEDIUM, "two_shot": ShotType.MEDIUM, "over_the_shoulder": ShotType.MEDIUM,
+    "medium_close_up": ShotType.CLOSE_UP,
+}
+_MOTION_ALIASES = {"orbit": CameraMotion.ORBIT_360, "tracking": CameraMotion.TRACKING,
+                   "push_in": CameraMotion.DOLLY_IN, "pull_out": CameraMotion.DOLLY_OUT}
+
+
+def _norm(v: Any) -> str:
+    return str(v).lower().strip().replace("-", "_").replace(" ", "_")
 
 
 class DialogueLine(BaseModel):
     speaker_id: str = Field(..., description="ID of the character speaking")
-    speaker_name: str = Field(..., description="Display name of speaker")
-    text: str = Field(..., description="Spoken line")
-    emotion: str = Field(default="neutral", description="Emotion/tone (e.g. tense, whispering, cheerful)")
-    start_offset: float = Field(default=0.0, description="Offset in seconds from shot start")
-    duration: float = Field(default=2.5, description="Estimated or actual audio duration")
+    speaker_name: str = Field(default="", description="Display name of speaker")
+    text: str = Field(..., description="Spoken line, in the production's dialogue language")
+    emotion: str = Field(default="neutral", description="Delivery direction, e.g. 'whispering, sardonic'")
+    start_offset: float = Field(default=0.5, ge=0.0, description="Seconds from shot start")
+    duration: float = Field(default=2.5, gt=0.0, description="Estimated spoken duration")
+    audio_path: Optional[str] = Field(None, description="Pre-recorded line (actor/TTS). Enables lipsync mode")
+
+
+class TextCue(BaseModel):
+    """On-screen text burned in post (models cannot be trusted to write letters)."""
+    text: str
+    start: float = Field(default=0.0, ge=0.0, description="Seconds from shot start")
+    end: float = Field(..., gt=0.0, description="Seconds from shot start")
+    position: str = Field(default="right", description="left | right | center | bottom | title")
 
 
 class CharacterProfile(BaseModel):
     id: str = Field(..., description="Unique slug ID (e.g. 'elena_vance')")
     name: str = Field(..., description="Full character name")
-    voice_id: str = Field(default="af_bella", description="Kokoro/F5-TTS voice ID or preset")
-    face_embedding_path: Optional[str] = Field(None, description="Path to InsightFace/PuLID embedding or ref image")
-    lora_name: Optional[str] = Field(None, description="ComfyUI LoRA model filename")
-    lora_strength: float = Field(default=0.85, ge=0.0, le=2.0)
-    invariable_clothing: str = Field(..., description="Fixed clothing prompt (e.g. 'navy wool trench coat, white collar')")
-    facial_features: str = Field(..., description="Prompts describing facial features for identity reinforcement")
+    description: str = Field(..., description="Who they are, age and build (e.g. 'a woman in her thirties')")
+    facial_features: str = Field(..., description="Face and hair; repeated verbatim in every prompt")
+    invariable_clothing: str = Field(..., description="Fixed wardrobe; describe material and color separately")
+    voice_description: str = Field(default="a natural voice", description="Voice direction for H3 native speech")
+    reference_image: Optional[str] = Field(None, description="Approved master portrait (relative to characters dir)")
+    approved: bool = Field(default=False, description="A human confirmed the master portrait")
+    lora_name: Optional[str] = Field(None, description="Krea 2 character LoRA used for the master portrait")
+    lora_strength: float = Field(default=1.0, ge=0.0, le=2.0)
     trigger_words: List[str] = Field(default_factory=list, description="LoRA trigger words")
+    refmod_name: Optional[str] = Field(None, description="MiniMax H3 RefMod (single-face shots only)")
+
+    def identity_block(self) -> str:
+        return f"{self.description}, {self.facial_features}, wearing {self.invariable_clothing}"
 
 
 class EnvironmentStage(BaseModel):
-    stage_id: str = Field(..., description="Identifier for stage/set (e.g. 'cyber_alley_rain')")
+    stage_id: str = Field(..., description="Identifier for stage/set (e.g. 'penthouse_terrace')")
     name: str = Field(..., description="Human readable name of location")
-    base_prompt: str = Field(..., description="Prompt describing empty scene / stage architecture")
-    depth_map_path: Optional[str] = Field(None, description="Path to ControlNet Depth or 3D projection reference")
-    locked_background_image: Optional[str] = Field(None, description="Path to pre-rendered locked environment frame")
-    lighting_conditions: str = Field(default="cinematic neon, rainy reflections, moody shadows")
+    base_prompt: str = Field(..., description="The empty location, with time of day and lighting")
+    locked_background_image: Optional[str] = Field(None, description="Rendered empty plate, reused by every shot")
 
 
 class ShotSpecification(BaseModel):
@@ -74,104 +108,94 @@ class ShotSpecification(BaseModel):
     shot_number: int = Field(default=1)
     shot_type: ShotType = Field(default=ShotType.MEDIUM)
     camera_motion: CameraMotion = Field(default=CameraMotion.STATIC)
-    action_description: str = Field(..., description="Detailed visual action taking place")
+    action_description: str = Field(..., description="What happens, in present tense, in temporal order")
     stage_id: str = Field(..., description="Reference to EnvironmentStage")
-    character_ids: List[str] = Field(default_factory=list, description="IDs of characters present in this shot")
+    character_ids: List[str] = Field(default_factory=list, description="Characters on screen, main one first")
     dialogue: List[DialogueLine] = Field(default_factory=list)
-    duration_sec: float = Field(default=4.0, ge=1.0, le=30.0)
+    sound_description: str = Field(default="", description="Diegetic sound for H3's native audio")
+    keyframe_action: Optional[str] = Field(None, description="What the first frame shows, if it differs from the action")
+    on_screen_text: List[TextCue] = Field(default_factory=list, description="Labels/titles burned in post")
+    duration_sec: float = Field(default=6.0, ge=1.0, le=15.0)
+
+    # Compiled by the Shotlist agent
+    keyframe_prompt: str = Field(default="", description="Krea 2 prompt for the first frame")
+    video_prompt: str = Field(default="", description="MiniMax H3 prompt (alignment line + [Shot 1] contract)")
+    length_frames: int = Field(default=124, description="H3 length: 5 + 17k frames, rendered >= duration")
+    seed: int = Field(default=42)
+    voice_track: Optional[str] = Field(None, description="Per-clip voice WAV for lipsync mode")
 
     @field_validator("shot_type", mode="before")
     @classmethod
     def normalize_shot_type(cls, v: Any) -> ShotType:
         if isinstance(v, ShotType):
             return v
-        s = str(v).lower().replace("-", "_").replace(" ", "_")
-        aliases = {
-            "close_up": ShotType.CLOSE_UP,
-            "closeup": ShotType.CLOSE_UP,
-            "extreme_close_up": ShotType.EXTREME_CLOSE_UP,
-            "cu": ShotType.CLOSE_UP,
-            "ecu": ShotType.EXTREME_CLOSE_UP,
-            "wide": ShotType.WIDE,
-            "wide_shot": ShotType.WIDE,
-            "extreme_wide": ShotType.EXTREME_WIDE,
-            "medium": ShotType.MEDIUM,
-            "mid_shot": ShotType.MEDIUM,
-            "medium_shot": ShotType.MEDIUM,
-            "two_shot": ShotType.MEDIUM,
-            "over_the_shoulder": ShotType.MEDIUM,
-        }
-        return aliases.get(s, ShotType.MEDIUM)
+        s = _norm(v)
+        try:
+            return ShotType(s)
+        except ValueError:
+            return _SHOT_ALIASES.get(s, ShotType.MEDIUM)
 
     @field_validator("camera_motion", mode="before")
     @classmethod
     def normalize_camera_motion(cls, v: Any) -> CameraMotion:
         if isinstance(v, CameraMotion):
             return v
-        s = str(v).lower().replace("-", "_").replace(" ", "_")
-        aliases = {
-            "static": CameraMotion.STATIC,
-            "pan_left": CameraMotion.PAN_LEFT,
-            "pan_right": CameraMotion.PAN_RIGHT,
-            "tilt_up": CameraMotion.TILT_UP,
-            "tilt_down": CameraMotion.TILT_DOWN,
-            "dolly_in": CameraMotion.DOLLY_IN,
-            "dolly_out": CameraMotion.DOLLY_OUT,
-            "crane_up": CameraMotion.CRANE_UP,
-            "orbit_360": CameraMotion.ORBIT_360,
-            "orbit": CameraMotion.ORBIT_360,
-            "tracking": CameraMotion.TRACKING,
-            "tracking_shot": CameraMotion.TRACKING,
-        }
-        return aliases.get(s, CameraMotion.STATIC)
-
-    # Prompt Engineering for Wan2.1 / Hunyuan / AnimateDiff
-    positive_prompt: str = Field(default="")
-    negative_prompt: str = Field(default="blurry, distorted, deformed hands, bad anatomy, lowres, watermark")
-    seed: int = Field(default=42)
-    denoise: float = Field(default=1.0, ge=0.0, le=1.0)
-    motion_bucket_id: int = Field(default=127, ge=1, le=255)
-    fps: int = Field(default=24)
-    resolution: tuple[int, int] = Field(default=(1024, 576))
+        s = _norm(v)
+        try:
+            return CameraMotion(s)
+        except ValueError:
+            return _MOTION_ALIASES.get(s, CameraMotion.STATIC)
 
 
 class SceneScript(BaseModel):
     scene_id: str = Field(..., description="e.g. 'SC_01'")
     title: str = Field(...)
-    location: str = Field(...)
+    location: str = Field(..., description="Empty location description used for the stage plate")
+    location_image: Optional[str] = Field(None, description="Photo of a real location, used instead of a generated plate")
     time_of_day: str = Field(default="night")
     mood: str = Field(default="suspenseful")
-    action_summary: str = Field(...)
+    action_summary: str = Field(default="")
+    music_description: str = Field(default="", description="Score direction for this scene")
     shots: List[ShotSpecification] = Field(default_factory=list)
 
 
 class ProductionScript(BaseModel):
     title: str = Field(default="Untitled Production")
-    premise: str = Field(...)
-    genre: str = Field(default="Sci-Fi Thriller")
-    target_duration_sec: float = Field(default=30.0)
+    premise: str = Field(default="")
+    genre: str = Field(default="Drama")
+    language: str = Field(default="English", description="Dialogue language passed to H3")
+    visual_style: str = Field(default="photorealistic cinematic film still, natural skin texture, shallow depth of field")
+    seed: Optional[int] = Field(None, description="Same seed for every shot (retakes still change it)")
     scenes: List[SceneScript] = Field(default_factory=list)
+
+    def all_shots(self) -> List[ShotSpecification]:
+        return [shot for scene in self.scenes for shot in scene.shots]
+
+
+class QCCheck(BaseModel):
+    name: str
+    status: CheckStatus
+    detail: str = ""
 
 
 class QCReport(BaseModel):
     shot_id: str
-    pass_qc: bool = Field(..., description="Whether the clip satisfies cinematic quality criteria")
-    identity_drift_score: float = Field(default=0.0, ge=0.0, le=1.0, description="0.0 = perfect match, 1.0 = unrecognizable")
-    deformed_faces: bool = Field(default=False)
-    deformed_hands: bool = Field(default=False)
-    motion_jitter: bool = Field(default=False)
-    error_codes: List[str] = Field(default_factory=list, description="e.g. ['ERR_HANDS_GT5', 'ERR_IDENTITY_DRIFT']")
+    attempt: int = 1
+    pass_qc: bool
+    checks: List[QCCheck] = Field(default_factory=list)
+    error_codes: List[str] = Field(default_factory=list)
     healing_action: HealingAction = Field(default=HealingAction.NONE)
-    suggested_seed: Optional[int] = None
-    suggested_denoise: Optional[float] = None
-    suggested_motion_bucket: Optional[int] = None
-    inspected_frames: List[str] = Field(default_factory=list, description="Paths to inspected frame thumbnails")
-    critique_notes: str = Field(default="")
+    transcript: str = Field(default="")
+    inspected_frames: List[str] = Field(default_factory=list)
+
+    @property
+    def unverified(self) -> List[str]:
+        return [c.name for c in self.checks if c.status == CheckStatus.SKIPPED]
 
 
 class AudioTrack(BaseModel):
     track_id: str
-    track_type: str = Field(..., description="'dialogue', 'foley', or 'music'")
+    track_type: str = Field(..., description="'dialogue', 'music' or 'clip' (H3 native audio)")
     file_path: str
     start_time: float = Field(default=0.0)
     duration_sec: float = Field(default=0.0)
@@ -181,14 +205,13 @@ class AudioTrack(BaseModel):
 
 class ShotRenderResult(BaseModel):
     shot_id: str
-    raw_video_path: Optional[str] = None
     keyframe_path: Optional[str] = None
-    healed_video_path: Optional[str] = None
-    upscaled_video_path: Optional[str] = None
+    raw_video_path: Optional[str] = None
+    final_video_path: Optional[str] = None
     qc_reports: List[QCReport] = Field(default_factory=list)
     approved: bool = False
     attempts: int = 0
-    final_video_path: Optional[str] = None
+    seed: int = 0
 
 
 class ProductionResult(BaseModel):
@@ -196,7 +219,6 @@ class ProductionResult(BaseModel):
     title: str
     final_master_path: str
     subtitles_srt_path: str
-    subtitles_ass_path: Optional[str] = None
     shot_results: List[ShotRenderResult] = Field(default_factory=list)
     total_duration_sec: float = 0.0
     qc_pass_rate: float = 0.0

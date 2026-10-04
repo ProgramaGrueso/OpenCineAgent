@@ -1,96 +1,53 @@
 """Agent 8: Loopback & Healing Agent (Layer C).
-Executes automated remediation when Critic/VLM Reviewer fails a clip:
-- Mild error: FaceDetailer / Inpainting pass guided by SAM.
-- Critical error: Mutates seed, lowers motion_bucket_id / denoise, and triggers re-generation.
+
+What actually fixes generated shots in practice:
+  * a new seed with the same prompt (two seeds usually yield one clearly better take; when two seeds
+    fail the same way the prompt is the problem, and that is reported instead of retried forever);
+  * CUDA out of memory -> a shorter clip (frames x reference images is what fills VRAM);
+  * if every attempt fails, the take with the fewest failed checks is kept and flagged.
+Every attempt stays on disk (<shot>_t<N>_s<seed>.mp4); nothing approved is overwritten.
 """
 
 from __future__ import annotations
 
-import asyncio
-import subprocess
-from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
+
 from opencine.agents.base import BaseAgent
-from opencine.core.comfy_client import ComfyUIClient, comfy_client
 from opencine.core.config import settings
-from opencine.core.models import HealingAction, QCReport, ShotSpecification
+from opencine.core.models import CheckStatus, QCReport, ShotSpecification
+from opencine.core.seeds import stable_seed
 
 
 class LoopbackHealingAgent(BaseAgent):
-    """Remediates defective clips or mutates generation parameters for retry loop."""
-
-    def __init__(self, client: Optional[ComfyUIClient] = None) -> None:
+    def __init__(self) -> None:
         super().__init__(name="LoopbackHealingAgent", layer="Layer C")
-        self.comfy = client or comfy_client
 
-    async def apply_face_detailer_pass(self, raw_video_path: Path, shot_id: str) -> Path:
-        """Applies FaceDetailer restoration. Uses ComfyUI FaceDetailer or cinematic unsharp/bilateral filter."""
-        healed_dir = settings.workspace_dir / "healed_clips"
-        healed_dir.mkdir(parents=True, exist_ok=True)
-        healed_video = healed_dir / f"{shot_id}_facedetailed.mp4"
+    def shorten_for_oom(self, shot: ShotSpecification) -> bool:
+        """Drops to the shortest trained length. Returns False if it is already there."""
+        if shot.length_frames <= settings.h3_min_frames:
+            return False
+        shot.length_frames = settings.h3_min_frames
+        shot.duration_sec = min(shot.duration_sec, settings.h3_min_frames / settings.fps)
+        self.logger.warning(f"{shot.shot_id}: OOM, retrying at {shot.length_frames} frames ({shot.duration_sec:.2f}s)")
+        return True
 
-        self.logger.info(f"Applying FaceDetailer restoration pass to {raw_video_path.name}")
+    @staticmethod
+    def same_failure_twice(reports: List[QCReport]) -> bool:
+        return len(reports) >= 2 and set(reports[-1].error_codes) == set(reports[-2].error_codes) != set()
 
-        # FFmpeg unsharp + smartblur enhancement simulating localized face detailer post-pass
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(raw_video_path),
-            "-vf", "smartblur=lr=1.2:ls=-0.8:lt=-3.5:cr=0.8:cs=0.0:ct=0.0,unsharp=5:5:0.8:5:5:0.0",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "17",
-            "-pix_fmt", "yuv420p",
-            str(healed_video)
-        ]
+    @staticmethod
+    def best_attempt(attempts: List[Tuple[QCReport, object]]) -> Tuple[QCReport, object]:
+        def score(item: Tuple[QCReport, object]) -> Tuple[int, int]:
+            report = item[0]
+            failed = sum(c.status == CheckStatus.FAILED for c in report.checks)
+            return failed, -report.attempt
+        return min(attempts, key=score)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        await proc.communicate()
-        return healed_video
-
-    def mutate_shot_parameters(self, shot: ShotSpecification, report: QCReport) -> ShotSpecification:
-        """Mutates hyperparameters to eliminate jitter or deformities on next generation pass."""
-        if report.suggested_seed is not None:
-            shot.seed = report.suggested_seed
-        else:
-            shot.seed = (shot.seed + 104729) % (2**31 - 1)
-
-        if report.suggested_denoise is not None:
-            shot.denoise = report.suggested_denoise
-        else:
-            shot.denoise = max(0.65, shot.denoise - 0.15)
-
-        if report.suggested_motion_bucket is not None:
-            shot.motion_bucket_id = report.suggested_motion_bucket
-        else:
-            shot.motion_bucket_id = max(80, int(shot.motion_bucket_id * 0.8))
-
-        self.logger.info(
-            f"Mutated shot {shot.shot_id} parameters: seed={shot.seed}, "
-            f"denoise={shot.denoise:.2f}, motion_bucket={shot.motion_bucket_id}"
-        )
+    async def execute(self, shot: ShotSpecification, report: QCReport) -> Optional[ShotSpecification]:
+        """Returns the shot to render next, or None when retrying will not help."""
+        if report.pass_qc or report.attempt > settings.max_qc_retries:
+            return None
+        shot.seed = stable_seed(shot.shot_id, "retry", report.attempt, shot.seed)
+        await self.emit("healing.retry", {"shot_id": shot.shot_id, "new_seed": shot.seed,
+                                          "errors": report.error_codes})
         return shot
-
-    async def execute(
-        self,
-        shot: ShotSpecification,
-        raw_video_path: Path,
-        report: QCReport
-    ) -> Tuple[Optional[Path], ShotSpecification]:
-        """Routes healing action based on QC findings."""
-        if report.healing_action == HealingAction.FACE_DETAILER:
-            healed = await self.apply_face_detailer_pass(raw_video_path, shot.shot_id)
-            await self.emit("healing.applied", {"shot_id": shot.shot_id, "action": "face_detailer", "path": str(healed)})
-            return healed, shot
-        
-        elif report.healing_action == HealingAction.RETRY_MUTATION:
-            mutated_shot = self.mutate_shot_parameters(shot, report)
-            await self.emit("healing.mutated", {
-                "shot_id": shot.shot_id,
-                "action": "retry_mutation",
-                "new_seed": mutated_shot.seed
-            })
-            return None, mutated_shot
-
-        return raw_video_path, shot

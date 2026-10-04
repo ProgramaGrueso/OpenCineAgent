@@ -1,70 +1,55 @@
-"""Agent 9: Super-Resolution & Frame Rate Agent (Layer C).
-Applies motion interpolation to 60 fps (RIFE / motion vectors) and rapid upscaling
-(4x-UltraSharp / Compact / High-Fidelity Lanczos) on QC-approved clips.
+"""Agent 9: Super-Resolution Agent (Layer C).
+
+Upscales approved clips to the master resolution and keeps H3's native audio
+(an upscaler that writes video only must not drop the dialogue).
+  lanczos       ffmpeg scale, no extra dependencies
+  clearreality  4x-ClearRealityV1 through spandrel, streamed in batches (opencine/tools/upscale_video.py);
+                needs a python with torch + spandrel (OPENCINE_UPSCALE_PYTHON, e.g. ComfyUI's venv)
+Frame rate stays at 24 fps: blended frame interpolation produces ghosting.
 """
 
 from __future__ import annotations
 
-import asyncio
-import subprocess
+import sys
 from pathlib import Path
-from typing import Optional
+
 from opencine.agents.base import BaseAgent
+from opencine.core import media
+from opencine.core.comfy_client import comfy_client
 from opencine.core.config import settings
+
+TOOL = Path(__file__).resolve().parent.parent / "tools" / "upscale_video.py"
 
 
 class SuperResolutionAgent(BaseAgent):
-    """Interpolates frame rate to 60 fps and upscales approved video clips to master 1080p/4K."""
-
-    def __init__(self, target_fps: int = 60, target_width: int = 1920, target_height: int = 1080) -> None:
+    def __init__(self, mode: str | None = None) -> None:
         super().__init__(name="SuperResolutionAgent", layer="Layer C")
-        self.target_fps = target_fps
-        self.target_width = target_width
-        self.target_height = target_height
+        self.mode = mode or settings.upscale_mode
 
-    async def execute(self, approved_video_path: Path, shot_id: str) -> Path:
-        """Processes approved clip through frame interpolation and super-resolution upscaling."""
-        upscaled_dir = settings.workspace_dir / "master_clips"
-        upscaled_dir.mkdir(parents=True, exist_ok=True)
-        output_path = upscaled_dir / f"{shot_id}_60fps_master.mp4"
+    async def execute(self, clip: Path, out_dir: Path, shot_id: str) -> Path:
+        if self.mode == "none":
+            return clip
+        w, h = settings.upscale_width, settings.upscale_height
+        target = out_dir / "masters" / f"{shot_id}.mp4"
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info(f"Applying Super-Resolution + {self.target_fps}fps interpolation to {shot_id}")
+        if self.mode == "clearreality":
+            if not settings.upscale_model_path:
+                raise ValueError("OPENCINE_UPSCALE_MODEL_PATH must point to 4x-ClearRealityV1.pth")
+            await comfy_client.free()  # the upscaler needs the VRAM ComfyUI is holding
+            silent = target.with_suffix(".video.mp4")
+            await media.run_cmd([settings.upscale_python or sys.executable, TOOL, clip, silent,
+                                 "--model", settings.upscale_model_path, "--width", w, "--height", h,
+                                 "--fps", settings.fps])
+            await media.run_cmd(["ffmpeg", "-v", "error", "-y", "-i", silent, "-i", clip, "-map", "0:v:0",
+                                 "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", target])
+            silent.unlink(missing_ok=True)
+        elif self.mode == "lanczos":
+            await media.run_cmd(["ffmpeg", "-v", "error", "-y", "-i", clip, "-vf",
+                                 f"scale={w}:{h}:flags=lanczos,unsharp=3:3:0.4", "-c:v", "libx264", "-crf", "16",
+                                 "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "copy", target])
+        else:
+            raise ValueError(f"Unknown upscale mode '{self.mode}' (none | lanczos | clearreality)")
 
-        # High quality FFmpeg pipeline with bicubic motion interpolation and lanczos upscaling
-        filter_chain = (
-            f"minterpolate=fps={self.target_fps}:mi_mode=blend,"
-            f"scale={self.target_width}:{self.target_height}:flags=lanczos,"
-            f"unsharp=3:3:0.5:3:3:0.0"
-        )
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(approved_video_path),
-            "-vf", filter_chain,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "16",
-            "-pix_fmt", "yuv420p",
-            str(output_path)
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            self.logger.error(f"Super-resolution failed: {stderr.decode()[:200]}")
-            # Fallback to copy or simpler scale if minterpolate has issue on specific host
-            cmd_fallback = [
-                "ffmpeg", "-y",
-                "-i", str(approved_video_path),
-                "-vf", f"scale={self.target_width}:{self.target_height}:flags=lanczos,fps={self.target_fps}",
-                "-c:v", "libx264",
-                "-crf", "17",
-                str(output_path)
-            ]
-            fallback_proc = await asyncio.create_subprocess_exec(*cmd_fallback)
-            await fallback_proc.communicate()
-
-        await self.emit("super_res.completed", {"shot_id": shot_id, "path": str(output_path), "fps": self.target_fps})
-        return output_path
+        await self.emit("superres.done", {"shot_id": shot_id, "path": str(target), "mode": self.mode})
+        return target

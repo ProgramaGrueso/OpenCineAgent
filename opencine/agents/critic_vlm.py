@@ -1,268 +1,174 @@
-"""Agent 7: Critic / VLM Reviewer Agent (Layer C).
-Extracts representative frames from rendered video clips and performs automated multimodal QC
-via local VLM (Qwen2.5-VL / Ollama) inspecting:
-1. Deformed faces
-2. Hands with >5 fingers
-3. Facial drift relative to character reference
-Returns strict deterministic JSON: { pass: bool, identity_drift_score: float, error_codes: list }
+"""Agent 7: Critic / Quality Control Agent (Layer C).
+
+Measurable checks on every rendered clip:
+  technical      container, frame count and audio stream match the shot spec
+  motion         the clip is not frozen or black
+  audio          speech-level audio exists when the shot has dialogue
+  dialogue       faster-whisper transcript vs the script lines (optional dependency)
+  identity       a local VLM (Ollama, e.g. qwen2.5vl) compares frames with the approved master
+                 portraits and looks for deformed faces/hands and extra people
+A check that cannot run is reported as SKIPPED, never as passed: "verified" means measured.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import difflib
 import json
-import subprocess
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import httpx
+import numpy as np
+
 from opencine.agents.base import BaseAgent
+from opencine.agents.identity_registry import AssetIdentityRegistryAgent
+from opencine.core import media
 from opencine.core.config import settings
-from opencine.core.models import HealingAction, QCReport
+from opencine.core.models import CheckStatus, HealingAction, QCCheck, QCReport, ShotSpecification
+
+_whisper_model = None
+
+
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text.lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(re.sub(r"[^\w\s]", " ", text).split())
+
+
+def dialogue_similarity(expected: str, heard: str) -> float:
+    a, b = _normalize(expected), _normalize(heard)
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
 
 
 class CriticVlmAgent(BaseAgent):
-    """Multimodal Quality Control Agent inspecting video frames for anatomical and identity defects."""
-
-    def __init__(
-        self,
-        ollama_url: Optional[str] = None,
-        model: Optional[str] = None,
-        drift_threshold: float = 0.28
-    ) -> None:
+    def __init__(self, registry_agent: Optional[AssetIdentityRegistryAgent] = None,
+                 ollama_url: Optional[str] = None, model: Optional[str] = None) -> None:
         super().__init__(name="CriticVlmAgent", layer="Layer C")
+        self.registry = registry_agent or AssetIdentityRegistryAgent()
         self.ollama_url = ollama_url or settings.ollama_url
         self.model = model or settings.vlm_reviewer_model
-        self.drift_threshold = drift_threshold
-        self._checked_model_availability: bool = False
-        self._model_is_available: bool = False
+        self._vlm_available: Optional[bool] = None
 
-    async def _verify_model_available(self) -> bool:
-        if self._checked_model_availability:
-            return self._model_is_available
+    # ------------------------------------------------------------ checks
+    def check_technical(self, shot: ShotSpecification, clip: Path) -> QCCheck:
+        info = media.probe(clip)
+        need = shot.duration_sec * settings.fps
+        problems = []
+        if not info.get("has_video"):
+            problems.append("no video stream")
+        if info.get("frames", 0) + 1 < need:
+            problems.append(f"{info.get('frames', 0):.0f} frames < {need:.0f} needed for {shot.duration_sec}s")
+        if not info.get("has_audio"):
+            problems.append("no audio stream")
+        detail = "; ".join(problems) or f"{info.get('width', 0):.0f}x{info.get('height', 0):.0f}, " \
+                                         f"{info.get('frames', 0):.0f} frames, audio ok"
+        return QCCheck(name="technical", status=CheckStatus.FAILED if problems else CheckStatus.PASSED, detail=detail)
+
+    def check_motion(self, clip: Path) -> QCCheck:
+        frames = media.gray_frames(clip, count=12).astype(np.float32)
+        if len(frames) < 2:
+            return QCCheck(name="motion", status=CheckStatus.FAILED, detail="could not decode frames")
+        brightness = float(frames.mean())
+        change = float(np.abs(np.diff(frames, axis=0)).mean())
+        if brightness < 6:
+            return QCCheck(name="motion", status=CheckStatus.FAILED, detail=f"black clip (mean luma {brightness:.1f})")
+        if change < 0.3:
+            return QCCheck(name="motion", status=CheckStatus.FAILED, detail=f"frozen clip (frame change {change:.2f})")
+        return QCCheck(name="motion", status=CheckStatus.PASSED, detail=f"frame change {change:.1f}")
+
+    def check_audio(self, shot: ShotSpecification, clip: Path) -> QCCheck:
+        level = media.rms_db(media.audio_samples(clip, end=shot.duration_sec))
+        if shot.dialogue and level < -45:
+            return QCCheck(name="audio", status=CheckStatus.FAILED, detail=f"near silent ({level:.0f} dBFS) with dialogue")
+        return QCCheck(name="audio", status=CheckStatus.PASSED, detail=f"{level:.0f} dBFS RMS")
+
+    async def check_dialogue(self, shot: ShotSpecification, clip: Path) -> tuple[QCCheck, str]:
+        if not shot.dialogue:
+            return QCCheck(name="dialogue", status=CheckStatus.PASSED, detail="no dialogue in shot"), ""
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
-                res = await client.get(f"{self.ollama_url}/api/tags")
-                if res.status_code == 200:
-                    tags = res.json().get("models", [])
-                    available_names = [m.get("name", "") for m in tags]
-                    # Check if requested model or family exists
-                    self._model_is_available = any(self.model in name for name in available_names)
-                    if not self._model_is_available:
-                        # Check if any vision model exists
-                        vlms = [m.get("name") for m in tags if "vl" in m.get("name", "").lower() or "vision" in m.get("name", "").lower()]
-                        if vlms:
-                            self.model = vlms[0]
-                            self._model_is_available = True
-                            self.logger.info(f"Auto-selected available local VLM: {self.model}")
-        except Exception:
-            self._model_is_available = False
+            transcript = await asyncio.to_thread(self._transcribe, clip, shot.duration_sec)
+        except ImportError:
+            return QCCheck(name="dialogue", status=CheckStatus.SKIPPED,
+                           detail="faster-whisper not installed (pip install -e '.[qc]')"), ""
+        expected = " ".join(line.text for line in shot.dialogue)
+        score = dialogue_similarity(expected, transcript)
+        status = CheckStatus.PASSED if score >= settings.dialogue_match_threshold else CheckStatus.FAILED
+        return QCCheck(name="dialogue", status=status, detail=f"similarity {score:.2f}: heard '{transcript[:120]}'"), transcript
 
-        self._checked_model_availability = True
-        return self._model_is_available
+    @staticmethod
+    def _transcribe(clip: Path, duration: float) -> str:
+        global _whisper_model
+        from faster_whisper import WhisperModel  # optional dependency
+        if _whisper_model is None:
+            _whisper_model = WhisperModel(settings.whisper_model, device="cpu", compute_type="int8")
+        segments, _ = _whisper_model.transcribe(str(clip), vad_filter=True)
+        return " ".join(s.text.strip() for s in segments if s.start < duration)
 
-    def extract_keyframes(self, video_path: Path, output_dir: Path, frame_count: int = 4) -> List[Path]:
-        """Extracts N evenly spaced frames from video using FFmpeg."""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        frame_pattern = output_dir / f"{video_path.stem}_frame_%02d.png"
+    async def _vlm_ready(self) -> bool:
+        if self._vlm_available is None:
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    tags = (await client.get(f"{self.ollama_url}/api/tags")).json().get("models", [])
+                names = [m.get("name", "") for m in tags]
+                self._vlm_available = any(n == self.model or n.startswith(self.model + ":") for n in names)
+            except httpx.HTTPError:
+                self._vlm_available = False
+        return self._vlm_available
 
-        # Extract frames evenly across duration
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(video_path),
-            "-vf", f"thumbnail={frame_count},scale=640:-1",
-            "-vframes", str(frame_count),
-            str(frame_pattern)
-        ]
-        
-        # If thumbnail selector yields fewer frames, fallback to fps-based sampling
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        extracted = sorted(list(output_dir.glob(f"{video_path.stem}_frame_*.png")))
-        
-        if len(extracted) < frame_count:
-            # Direct select filter fallback
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", str(video_path),
-                "-vf", "select='not(mod(n\\,12))',scale=640:-1",
-                "-vsync", "vfr",
-                "-vframes", str(frame_count),
-                str(frame_pattern)
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            extracted = sorted(list(output_dir.glob(f"{video_path.stem}_frame_*.png")))
-
-        return extracted[:frame_count]
-
-    def _encode_image_base64(self, img_path: Path) -> str:
-        """Converts image file to base64 string."""
-        with open(img_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-
-    async def _query_ollama_vlm(self, shot_id: str, frame_paths: List[Path]) -> Optional[Dict[str, Any]]:
-        """Sends extracted frames to local Qwen2.5-VL via Ollama API."""
-        if not frame_paths:
-            return None
-
-        if not await self._verify_model_available():
-            return None
-
-        # Build prompt as specified in the blueprint
-        system_instruction = (
-            "You are a strict automated visual quality control agent for cinematic video generation. "
-            "Inspect the provided sequence of video frames carefully.\n"
-            "Verify:\n"
-            "1. Deformed, melting, or asymmetrical faces.\n"
-            "2. Hands with >5 fingers, mutated digits, or claw artifacts.\n"
-            "3. Identity drift, unnatural anatomical jitter, or temporal incoherence.\n"
-            "Return ONLY a deterministic JSON object with this exact structure:\n"
-            "{\n"
-            '  "pass": true,\n'
-            '  "identity_drift_score": 0.12,\n'
-            '  "deformed_faces": false,\n'
-            '  "deformed_hands": false,\n'
-            '  "motion_jitter": false,\n'
-            '  "error_codes": [],\n'
-            '  "critique_notes": "Clean cinematic execution with stable anatomy."\n'
-            "}\n"
-            "identity_drift_score must be a float between 0.0 (perfect) and 1.0 (unusable). "
-            "If deformed_faces or deformed_hands is true, pass MUST be false. "
-            "Return strictly valid JSON without markdown tags."
+    async def check_identity(self, shot: ShotSpecification, frames: List[Path]) -> QCCheck:
+        cast = self.registry.cast(shot.character_ids)
+        if not await self._vlm_ready():
+            return QCCheck(name="identity", status=CheckStatus.SKIPPED,
+                           detail=f"VLM '{self.model}' not available in Ollama (ollama pull {self.model})")
+        refs = [self.registry.reference_path(c) for c in cast]
+        images = [base64.b64encode(p.read_bytes()).decode() for p in [*refs, *frames] if p]
+        roster = "; ".join(f"reference image {i + 1} is {c.name}" for i, c in enumerate(cast)) or "no reference people"
+        question = (
+            f"The first {len(cast)} image(s) are reference portraits: {roster}. The remaining {len(frames)} images are "
+            f"frames of one generated video shot. Expected on screen: {len(cast)} person(s).\n"
+            "Answer ONLY JSON: {\"same_identity\": [true/false per reference person], \"deformed_face\": bool, "
+            "\"deformed_hands\": bool, \"extra_people\": bool, \"notes\": \"short reason\"}. "
+            "same_identity is false if the face in the frames is clearly a different person."
         )
-
-        base64_images = [self._encode_image_base64(p) for p in frame_paths]
-
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Perform strict QC inspection on these {len(frame_paths)} frames for shot {shot_id}. "
-                        "Return ONLY JSON."
-                    ),
-                    "images": base64_images
-                }
-            ],
-            "system": system_instruction,
-            "stream": False,
-            "format": "json"
-        }
-
         try:
             async with httpx.AsyncClient(timeout=settings.ollama_timeout) as client:
-                res = await client.post(f"{self.ollama_url}/api/chat", json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    raw_text = data.get("message", {}).get("content", "").strip()
-                    # Strip any potential markdown formatting
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text.split("```")[1]
-                        if raw_text.startswith("json"):
-                            raw_text = raw_text[4:]
-                    return json.loads(raw_text)
-                else:
-                    self.logger.warning(f"Ollama VLM query returned {res.status_code}: {res.text}")
-        except Exception as exc:
-            self.logger.warning(f"VLM model {self.model} inspection error: {exc}. Engaging heuristic inspection.")
+                res = await client.post(f"{self.ollama_url}/api/chat", json={
+                    "model": self.model, "stream": False, "format": "json", "options": {"temperature": 0},
+                    "messages": [{"role": "user", "content": question, "images": images}]})
+            res.raise_for_status()
+            verdict: Dict[str, Any] = json.loads(res.json()["message"]["content"])
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
+            return QCCheck(name="identity", status=CheckStatus.SKIPPED, detail=f"VLM error: {exc}")
+        same = verdict.get("same_identity", [])
+        same = same if isinstance(same, list) else [same]
+        failures = [cast[i].name for i, ok in enumerate(same[:len(cast)]) if ok is False]
+        if verdict.get("deformed_face"):
+            failures.append("deformed face")
+        if verdict.get("deformed_hands"):
+            failures.append("deformed hands")
+        if verdict.get("extra_people"):
+            failures.append("extra people")
+        detail = f"{', '.join(failures) or 'consistent'} - {verdict.get('notes', '')}"[:300]
+        return QCCheck(name="identity", status=CheckStatus.FAILED if failures else CheckStatus.PASSED, detail=detail)
 
-        return None
+    # ------------------------------------------------------------ main
+    async def execute(self, shot: ShotSpecification, clip: Path, out_dir: Path, attempt: int = 1) -> QCReport:
+        checks = [self.check_technical(shot, clip), self.check_motion(clip), self.check_audio(shot, clip)]
+        dialogue_check, transcript = await self.check_dialogue(shot, clip)
+        checks.append(dialogue_check)
+        frames = await media.extract_frames(clip, out_dir / "qc" / f"{shot.shot_id}_t{attempt}", count=4)
+        checks.append(await self.check_identity(shot, frames))
 
-    def _heuristic_inspection(self, shot_id: str, frame_paths: List[Path], seed: int) -> Dict[str, Any]:
-        """Deterministic heuristic inspection when VLM endpoint is processing or unavailable.
-        Injects controlled testability: certain deterministic seed patterns test rejection & healing.
-        """
-        # Seeds ending in 7 simulate mild facial issue (triggers FaceDetailer)
-        # Seeds ending in 9 simulate critical motion jitter / hands (triggers retry mutation)
-        is_critical_fail = (seed % 10 == 9)
-        is_mild_fail = (seed % 10 == 7)
-
-        if is_critical_fail:
-            return {
-                "pass": False,
-                "identity_drift_score": 0.42,
-                "deformed_faces": False,
-                "deformed_hands": True,
-                "motion_jitter": True,
-                "error_codes": ["ERR_HANDS_GT5", "ERR_MOTION_JITTER"],
-                "critique_notes": "Temporal motion jitter detected on background lines and extra finger on foreground hand."
-            }
-        elif is_mild_fail:
-            return {
-                "pass": False,
-                "identity_drift_score": 0.22,
-                "deformed_faces": True,
-                "deformed_hands": False,
-                "motion_jitter": False,
-                "error_codes": ["ERR_FACE_ASYMMETRY"],
-                "critique_notes": "Subtle pupil misalignment and asymmetry in left eye. Suitable for FaceDetailer SAM pass."
-            }
-        else:
-            return {
-                "pass": True,
-                "identity_drift_score": 0.08,
-                "deformed_faces": False,
-                "deformed_hands": False,
-                "motion_jitter": False,
-                "error_codes": [],
-                "critique_notes": "Sharp anatomical consistency, no drift or duplicate digits observed."
-            }
-
-    async def execute(self, shot_id: str, video_path: Path, seed: int = 42) -> QCReport:
-        """Inspects video clip and returns standard QCReport."""
-        frames_dir = settings.workspace_dir / "qc_frames" / shot_id
-        extracted = self.extract_keyframes(video_path, frames_dir, frame_count=4)
-
-        # 1. Try local VLM Qwen2.5-VL inspection
-        vlm_data = await self._query_ollama_vlm(shot_id, extracted)
-
-        # 2. Fallback to heuristic inspection if VLM unavailable
-        if not vlm_data or not isinstance(vlm_data, dict):
-            vlm_data = self._heuristic_inspection(shot_id, extracted, seed)
-
-        pass_qc = bool(vlm_data.get("pass", True))
-        drift = float(vlm_data.get("identity_drift_score", 0.1))
-        errs = list(vlm_data.get("error_codes", []))
-        def_faces = bool(vlm_data.get("deformed_faces", False))
-        def_hands = bool(vlm_data.get("deformed_hands", False))
-        jitter = bool(vlm_data.get("motion_jitter", False))
-
-        # Enforce threshold logic
-        if drift > self.drift_threshold or def_faces or def_hands or jitter:
-            pass_qc = False
-
-        # Determine healing routing as outlined in Blueprint:
-        # Mild error -> FaceDetailer / SAM
-        # Critical error -> Retry mutation (seed change, denoise reduction, motion bucket)
-        healing_action = HealingAction.NONE
-        suggested_seed = None
-        suggested_denoise = None
-        suggested_motion_bucket = None
-
-        if not pass_qc:
-            if def_faces and not (def_hands or jitter or drift > 0.35):
-                healing_action = HealingAction.FACE_DETAILER
-            else:
-                healing_action = HealingAction.RETRY_MUTATION
-                suggested_seed = (seed + 7919) % (2**31 - 1)
-                suggested_denoise = 0.85
-                suggested_motion_bucket = max(80, int(127 * 0.8))
-
+        failed = [c for c in checks if c.status == CheckStatus.FAILED]
         report = QCReport(
-            shot_id=shot_id,
-            pass_qc=pass_qc,
-            identity_drift_score=drift,
-            deformed_faces=def_faces,
-            deformed_hands=def_hands,
-            motion_jitter=jitter,
-            error_codes=errs,
-            healing_action=healing_action,
-            suggested_seed=suggested_seed,
-            suggested_denoise=suggested_denoise,
-            suggested_motion_bucket=suggested_motion_bucket,
-            inspected_frames=[str(p) for p in extracted],
-            critique_notes=str(vlm_data.get("critique_notes", ""))
+            shot_id=shot.shot_id, attempt=attempt, pass_qc=not failed, checks=checks,
+            error_codes=[f"ERR_{c.name.upper()}" for c in failed],
+            healing_action=HealingAction.RETRY_NEW_SEED if failed else HealingAction.NONE,
+            transcript=transcript, inspected_frames=[str(p) for p in frames],
         )
-
-        event_name = "qc.approved" if pass_qc else "qc.rejected"
-        await self.emit(event_name, report.model_dump())
+        await self.emit("qc.approved" if report.pass_qc else "qc.rejected", report.model_dump(mode="json"))
         return report
