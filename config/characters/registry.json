@@ -1,0 +1,62 @@
+[
+  {
+    "id": "elena_vance",
+    "name": "Elena Vance",
+    "voice_id": "af_bella",
+    "face_embedding_path": "/mnt/Datos/Proyecto/OpenCineAgent/config/characters/elena_vance_face.safetensors",
+    "lora_name": "elena_vance_v2.safetensors",
+    "lora_strength": 0.85,
+    "invariable_clothing": "navy blue high-collar wool trench coat, dark turtleneck, titanium wristwatch",
+    "facial_features": "sharp jawline, piercing emerald eyes, raven hair tied in a sleek low ponytail, slight scar on left brow",
+    "trigger_words": [
+      "elena_vance_style",
+      "cinematic lighting",
+      "8k portrait"
+    ]
+  },
+  {
+    "id": "marcus_reid",
+    "name": "Marcus Reid",
+    "voice_id": "am_adam",
+    "face_embedding_path": "/mnt/Datos/Proyecto/OpenCineAgent/config/characters/marcus_reid_face.safetensors",
+    "lora_name": "marcus_reid_v1.safetensors",
+    "lora_strength": 0.8,
+    "invariable_clothing": "tactical charcoal bomber jacket, faded grey henley, rugged leather holster harness",
+    "facial_features": "weathered rugged face, trimmed salt-and-pepper beard, intense hazel eyes, prominent nose bridge",
+    "trigger_words": [
+      "marcus_reid_soldier",
+      "photorealistic",
+      "raw texture"
+    ]
+  },
+  {
+    "id": "maya_lin",
+    "name": "Dr. Maya Lin",
+    "voice_id": "af_sarah",
+    "face_embedding_path": "/mnt/Datos/Proyecto/OpenCineAgent/config/characters/maya_lin_face.safetensors",
+    "lora_name": "maya_lin_cyber.safetensors",
+    "lora_strength": 0.88,
+    "invariable_clothing": "minimalist white lab tunic with luminescent cyan stitching, graphite trousers",
+    "facial_features": "delicate features, warm amber eyes, asymmetrical chin-length obsidian bob, augmented optic temple piece",
+    "trigger_words": [
+      "maya_lin_scientist",
+      "subsurface scattering",
+      "masterpiece"
+    ]
+  },
+  {
+    "id": "victor_cross",
+    "name": "Victor Cross",
+    "voice_id": "am_michael",
+    "face_embedding_path": "/mnt/Datos/Proyecto/OpenCineAgent/config/characters/victor_cross_face.safetensors",
+    "lora_name": "victor_cross_noir.safetensors",
+    "lora_strength": 0.82,
+    "invariable_clothing": "bespoke pinstripe charcoal three-piece suit, silver signet ring, silk obsidian tie",
+    "facial_features": "stoic aristocratic expression, slicked-back platinum hair, steel-blue eyes, subtle cybernetic cheek seam",
+    "trigger_words": [
+      "victor_cross_exec",
+      "noir lighting",
+      "dramatic rim light"
+    ]
+  }
+]

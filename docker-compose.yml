@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  comfyui:
+    image: yanwk/comfyui-boot:cu124
+    container_name: opencine-comfyui
+    restart: unless-stopped
+    ports:
+      - "8188:8188"
+    environment:
+      - CLI_ARGS=--listen 0.0.0.0 --port 8188
+    volumes:
+      - ./storage/comfyui/models:/root/ComfyUI/models
+      - ./storage/comfyui/output:/root/ComfyUI/output
+      - ./storage/comfyui/custom_nodes:/root/ComfyUI/custom_nodes
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: opencine-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./storage/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  opencine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opencine-orchestrator
+    depends_on:
+      - comfyui
+      - ollama
+    environment:
+      - OPENCINE_COMFYUI_HOST=comfyui
+      - OPENCINE_COMFYUI_PORT=8188
+      - OPENCINE_OLLAMA_URL=http://ollama:11434
+      - OPENCINE_LLM_SCRIPTWRITER_MODEL=qwen3:8b
+      - OPENCINE_VLM_REVIEWER_MODEL=qwen2.5-vl:7b
+    volumes:
+      - ./workspace:/app/workspace
+      - ./config:/app/config
+    command: ["python", "main.py", "healthcheck"]
