@@ -57,6 +57,11 @@ non_diegetic_music: No music.
   between clients: call `/free` between jobs (done automatically). A video player open on the GPU
   can be enough to cause an OOM.
 - A cold load of the H3 UNET takes several minutes the first time; it is not hung.
+- Measured on a 4070 Ti SUPER: a 243-frame clip at 1024x576 with `max` references and a RefMod takes
+  11.5-12.6 min. Downscaling the references to 768 px did not make it faster (the frames dominate the
+  cost), so references stay at full size. See CHANGELOG.md for the other measurements.
+- ComfyUI keeps loaded models in RAM (31-36 GB with H3 + Krea 2). On a 64 GB machine that leaves
+  little room: `/free` releases it between productions.
 
 ## ComfyUI API pitfalls
 

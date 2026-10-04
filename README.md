@@ -181,7 +181,8 @@ line of the shot: the agent builds a per-clip track at the exact offsets and H3 
 | Step | Time |
 |---|---|
 | Krea 2 portrait / plate / keyframe | 20 s - 1.5 min each |
-| MiniMax H3 clip, 124-262 frames | ~1.5-3 min (8-step distilled); first load of the UNET takes several minutes |
+| MiniMax H3 clip, 124-158 frames at 1024x576 | ~3-4 min (8-step distilled); first load of the UNET takes several minutes |
+| MiniMax H3 clip, 243 frames (10 s) at 1024x576, RefMod | ~12 min |
 | A 45 s episode (3 clips x 15 s) | ~22 min |
 | 50 s commercial, 13 clips + retakes, upscale, mix | ~1 h 15 min |
 
